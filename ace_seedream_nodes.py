@@ -25,6 +25,24 @@ FAL_EDIT_URL = "https://fal.run/bytedance/seedream/v5/pro/edit"
 TIMEOUT = 600
 
 
+import threading
+
+_rate_lock = threading.Lock()
+_last_call_time = 0.0
+
+
+def _throttled_call(func, *args, **kwargs):
+    """Global 1 call/second throttle across threads."""
+    global _last_call_time
+    with _rate_lock:
+        now = time.time()
+        wait = max(0.0, 1.0 - (now - _last_call_time))
+        _last_call_time = now + wait
+    if wait > 0:
+        time.sleep(wait)
+    return func(*args, **kwargs)
+
+
 def _output_dir() -> str:
     try:
         import folder_paths
@@ -60,6 +78,14 @@ def _tensor_to_data_uri(x: torch.Tensor) -> str:
     buf = BytesIO()
     _tensor_to_pil(x).save(buf, "PNG")
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def _tensor_frames_to_data_uris(x: torch.Tensor) -> List[str]:
+    """Explode a [B,H,W,C] batch (or single image) into one data URI per frame."""
+    t = x.detach().cpu()
+    if t.ndim == 3:
+        t = t[None, ...]
+    return [_tensor_to_data_uri(t[i]) for i in range(t.shape[0])]
 
 
 def _get_key(api_key: str) -> str:
@@ -167,6 +193,13 @@ class AceSeedreamLayerize:
                     "BOOLEAN",
                     {"default": True, "tooltip": "Save untouched layer PNGs (with alpha) to the output folder"},
                 ),
+                "compare_modes": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Run BOTH standard and fast once and put both base images side by side in base_image (frame 1 = standard, frame 2 = fast) with timings in the log. Layers/masks come from the mode selected above. Costs two generations.",
+                    },
+                ),
             },
         }
 
@@ -179,6 +212,22 @@ class AceSeedreamLayerize:
         "Layer count is model-decided (no API parameter); steer via prompt."
     )
 
+    def _call(self, key: str, image: torch.Tensor, prompt: str, image_size: str,
+              enable_safety_checker: bool, mode: str, log: List[str]) -> Tuple[dict, float]:
+        payload = {
+            "image_url": _tensor_to_data_uri(image),
+            "image_size": image_size,
+            "enable_safety_checker": enable_safety_checker,
+            "enhance_prompt_mode": mode,
+        }
+        if prompt.strip():
+            payload["prompt"] = prompt.strip()
+        t0 = time.time()
+        data = _fal_post(FAL_LAYERIZE_URL, key, payload)
+        dt = time.time() - t0
+        log.append(f"[{mode}] API call completed in {dt:.1f}s")
+        return data, dt
+
     def run(
         self,
         api_key: str,
@@ -188,23 +237,28 @@ class AceSeedreamLayerize:
         enable_safety_checker: bool = True,
         enhance_prompt_mode: str = "standard",
         save_raw: bool = True,
+        compare_modes: bool = False,
         **kwargs,
     ):
         key = _get_key(api_key)
         log: List[str] = []
 
-        payload = {
-            "image_url": _tensor_to_data_uri(image),
-            "image_size": image_size,
-            "enable_safety_checker": enable_safety_checker,
-            "enhance_prompt_mode": enhance_prompt_mode,
-        }
-        if prompt.strip():
-            payload["prompt"] = prompt.strip()
-
-        t0 = time.time()
-        data = _fal_post(FAL_LAYERIZE_URL, key, payload)
-        log.append(f"API call completed in {time.time() - t0:.1f}s")
+        compare_base: Optional[Image.Image] = None
+        if compare_modes:
+            other = "fast" if enhance_prompt_mode == "standard" else "standard"
+            data_a, dt_a = self._call(key, image, prompt, image_size, enable_safety_checker, enhance_prompt_mode, log)
+            data_b, dt_b = self._call(key, image, prompt, image_size, enable_safety_checker, other, log)
+            log.append(f"compare: {enhance_prompt_mode} {dt_a:.1f}s vs {other} {dt_b:.1f}s")
+            data = data_a
+            try:
+                for layer in (data_b.get("layers") or []):
+                    if layer.get("z_index", 1) == 0 and (layer.get("image") or {}).get("url"):
+                        compare_base = Image.open(BytesIO(_download(layer["image"]["url"])))
+                        break
+            except Exception as e:
+                log.append(f"compare base fetch failed: {e}")
+        else:
+            data, _ = self._call(key, image, prompt, image_size, enable_safety_checker, enhance_prompt_mode, log)
 
         layers = data.get("layers") or []
         if not layers:
@@ -247,7 +301,13 @@ class AceSeedreamLayerize:
 
         log.append(f"{len(info)} layers total ({len(layer_pils)} above base)")
 
-        base_t = _pil_to_tensor_rgb(base_pil) if base_pil is not None else _placeholder()
+        if base_pil is not None and compare_base is not None:
+            base_t = _stack_rgb([base_pil, compare_base])
+            log.append("base_image batch: frame 1 = selected mode, frame 2 = other mode")
+        elif base_pil is not None:
+            base_t = _pil_to_tensor_rgb(base_pil)
+        else:
+            base_t = _placeholder()
         layers_t = _stack_rgb(layer_pils) if layer_pils else _placeholder()
         masks_t = _stack_alpha(layer_pils) if layer_pils else _placeholder_mask()
 
@@ -275,6 +335,13 @@ class AceSeedreamProEdit:
                 {"default": True, "tooltip": "Save untouched result files to the output folder"},
             ),
         }
+        opt["layers"] = (
+            "IMAGE",
+            {
+                "forceInput": False,
+                "tooltip": "Batch input (e.g. Layerize 'layers' output). Every image in the batch is sent as a separate reference.",
+            },
+        )
         for i in range(1, 11):
             opt[f"image_{i}"] = ("IMAGE", {"forceInput": False})
         return {
@@ -316,10 +383,18 @@ class AceSeedreamProEdit:
         log: List[str] = []
 
         image_urls = []
+        layers_in = kwargs.get("layers")
+        if isinstance(layers_in, torch.Tensor):
+            image_urls.extend(_tensor_frames_to_data_uris(layers_in))
         for i in range(1, 11):
             im = kwargs.get(f"image_{i}")
             if isinstance(im, torch.Tensor):
-                image_urls.append(_tensor_to_data_uri(im))
+                image_urls.extend(_tensor_frames_to_data_uris(im))
+        if len(image_urls) > 10:
+            log.append(
+                f"{len(image_urls)} reference images collected; API uses only the LAST 10 - trimming to first 10 instead for predictability."
+            )
+            image_urls = image_urls[:10]
         if not image_urls:
             raise RuntimeError("Connect at least one image (image_1..image_10).")
         if not prompt.strip():
@@ -368,11 +443,391 @@ class AceSeedreamProEdit:
         return (_stack_rgb(pils), "\n".join(raw_paths), "\n".join(log))
 
 
+# =====================================================================
+# BytePlus ModelArk (Ark) variants
+# =====================================================================
+
+ARK_DEFAULT_BASE = "https://ark.ap-southeast.bytepluses.com/api/v3"
+ARK_DEFAULT_MODEL = "seedream-5-0-pro"
+
+
+def _get_ark_key(api_key: str) -> str:
+    key = (api_key or "").strip() or os.getenv("ARK_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError(
+            "SEEDREAM ERROR: No API key in node input or ARK_API_KEY environment variable."
+        )
+    return key
+
+
+def _ark_post(base_url: str, key: str, payload: dict) -> dict:
+    url = base_url.rstrip("/") + "/images/generations"
+    resp = requests.post(
+        url,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=TIMEOUT,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"Ark API {resp.status_code}: {resp.text[:2000]}\n"
+            "If the error mentions the model, check the exact model ID in your Ark console Model list."
+        )
+    return resp.json()
+
+
+def _ark_item_bytes(item: dict) -> bytes:
+    if item.get("b64_json"):
+        return base64.b64decode(item["b64_json"])
+    if item.get("url"):
+        return _download(item["url"])
+    raise RuntimeError(f"Ark item has neither url nor b64_json: {list(item.keys())}")
+
+
+class AceSeedreamLayerizeArk:
+    """Layer decomposition via BytePlus ModelArk (layer_decomposition=true)."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "api_key": (
+                    "STRING",
+                    {"default": "", "password": True, "tooltip": "Ark API key (or set ARK_API_KEY env)"},
+                ),
+                "image": ("IMAGE", {"tooltip": "Image to decompose"}),
+                "model": (
+                    "STRING",
+                    {"default": ARK_DEFAULT_MODEL, "tooltip": "Exact model ID from your Ark console Model list"},
+                ),
+                "prompt": (
+                    "STRING",
+                    {"default": "", "multiline": True, "tooltip": "Which elements to separate. Empty = auto."},
+                ),
+            },
+            "optional": {
+                "num_layers": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 16,
+                        "tooltip": "0 = model decides. Otherwise injected into the prompt as guidance - the API has NO layer-count parameter, so this steers but does not guarantee.",
+                    },
+                ),
+                "size": ("STRING", {"default": "2K", "tooltip": "e.g. 2K, 4K or 2048x2048"}),
+                "seed": ("INT", {"default": -1, "min": -1, "max": 0x7FFFFFFF, "tooltip": "-1 = omit"}),
+                "watermark": (
+                    "BOOLEAN",
+                    {"default": False, "tooltip": "BytePlus visible AI-generated watermark on outputs"},
+                ),
+                "response_format": (["url", "b64_json"], {"default": "url"}),
+                "base_url": ("STRING", {"default": ARK_DEFAULT_BASE}),
+                "save_raw": (
+                    "BOOLEAN",
+                    {"default": True, "tooltip": "Save untouched layer files to the output folder"},
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "IMAGE", "MASK", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("base_image", "layers", "layer_masks", "layer_info", "raw_paths", "operation_log")
+    FUNCTION = "run"
+    CATEGORY = "Ace_Seedream"
+    DESCRIPTION = (
+        "Seedream layer decomposition via BytePlus Ark. Layer count is model-decided; "
+        "num_layers only steers via the prompt."
+    )
+
+    def run(
+        self,
+        api_key: str,
+        image: torch.Tensor,
+        model: str = ARK_DEFAULT_MODEL,
+        prompt: str = "",
+        num_layers: int = 0,
+        size: str = "2K",
+        seed: int = -1,
+        watermark: bool = False,
+        response_format: str = "url",
+        base_url: str = ARK_DEFAULT_BASE,
+        save_raw: bool = True,
+        **kwargs,
+    ):
+        key = _get_ark_key(api_key)
+        log: List[str] = []
+
+        p = prompt.strip()
+        if num_layers > 0:
+            steer = f"Decompose the image into exactly {num_layers} separate layers."
+            p = (p + " " + steer).strip() if p else steer
+            log.append(
+                f"num_layers={num_layers}: prompt-steered only (no API parameter exists); model may deviate."
+            )
+
+        payload = {
+            "model": model.strip(),
+            "image": [_tensor_to_data_uri(image)],
+            "layer_decomposition": True,
+            "size": size.strip() or "2K",
+            "response_format": response_format,
+            "watermark": watermark,
+        }
+        if p:
+            payload["prompt"] = p
+        if seed >= 0:
+            payload["seed"] = seed
+
+        t0 = time.time()
+        data = _ark_post(base_url, key, payload)
+        log.append(f"Ark call completed in {time.time() - t0:.1f}s")
+
+        items = data.get("data") or []
+        if not items:
+            raise RuntimeError(f"No data returned. Response: {json.dumps(data)[:1500]}")
+
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        base_pil: Optional[Image.Image] = None
+        layer_pils: List[Image.Image] = []
+        info: List[dict] = []
+        raw_paths: List[str] = []
+
+        for idx, item in enumerate(items):
+            raw = _ark_item_bytes(item)
+            pil = Image.open(BytesIO(raw))
+            z = item.get("z_index", idx)
+            name = item.get("name") or ("base" if z == 0 else f"layer_{z}")
+            if save_raw:
+                safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in name)[:40]
+                rp = _save_raw(raw, f"seedream_ark_layer_{stamp}_z{z:02d}_{safe}.png", log)
+                if rp:
+                    raw_paths.append(rp)
+            info.append(
+                {
+                    "z_index": z,
+                    "name": item.get("name"),
+                    "description": item.get("description"),
+                    "bounding_box": item.get("bounding_box"),
+                    "size": item.get("size"),
+                    "url": item.get("url"),
+                }
+            )
+            if z == 0 and base_pil is None:
+                base_pil = pil
+            else:
+                layer_pils.append(pil)
+
+        log.append(f"{len(info)} items total ({len(layer_pils)} above base)")
+        if data.get("usage"):
+            log.append(f"usage: {json.dumps(data['usage'])}")
+
+        base_t = _pil_to_tensor_rgb(base_pil) if base_pil is not None else _placeholder()
+        layers_t = _stack_rgb(layer_pils) if layer_pils else _placeholder()
+        masks_t = _stack_alpha(layer_pils) if layer_pils else _placeholder_mask()
+
+        return (
+            base_t,
+            layers_t,
+            masks_t,
+            json.dumps(info, indent=2),
+            "\n".join(raw_paths),
+            "\n".join(log),
+        )
+
+
+class AceSeedreamProEditArk:
+    """Ark edit with nano-banana-style parallel slots (5 outputs)."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        opt = {
+            "size": ("STRING", {"default": "2K", "tooltip": "e.g. 2K, 4K or 2048x2048"}),
+            "seed": ("INT", {"default": -1, "min": -1, "max": 0x7FFFFFFF, "tooltip": "-1 = omit; slot N uses seed+N-1"}),
+            "watermark": ("BOOLEAN", {"default": False}),
+            "response_format": (["url", "b64_json"], {"default": "url"}),
+            "sequential_image_generation": (["disabled", "auto"], {"default": "disabled"}),
+            "max_images": (
+                "INT",
+                {"default": 1, "min": 1, "max": 15, "tooltip": "Only used when sequential_image_generation=auto"},
+            ),
+            "base_url": ("STRING", {"default": ARK_DEFAULT_BASE}),
+            "save_raw": ("BOOLEAN", {"default": True}),
+        }
+        for i in range(1, 6):
+            opt[f"source_image_{i}"] = ("IMAGE", {"forceInput": False})
+            opt[f"ref_a_{i}"] = ("IMAGE", {"forceInput": False})
+            opt[f"ref_b_{i}"] = ("IMAGE", {"forceInput": False})
+        return {
+            "required": {
+                "api_key": (
+                    "STRING",
+                    {"default": "", "password": True, "tooltip": "Ark API key (or set ARK_API_KEY env)"},
+                ),
+                "model": (
+                    "STRING",
+                    {"default": ARK_DEFAULT_MODEL, "tooltip": "Exact model ID from your Ark console Model list"},
+                ),
+                "in_parallel": ("INT", {"default": 1, "min": 1, "max": 5}),
+                "parallels_share_inputs": ("BOOLEAN", {"default": True}),
+                "prompt_1": ("STRING", {"default": "", "multiline": True, "placeholder": "Prompt 1"}),
+                "prompt_2": ("STRING", {"default": "", "multiline": True, "placeholder": "Prompt 2"}),
+                "prompt_3": ("STRING", {"default": "", "multiline": True, "placeholder": "Prompt 3"}),
+                "prompt_4": ("STRING", {"default": "", "multiline": True, "placeholder": "Prompt 4"}),
+                "prompt_5": ("STRING", {"default": "", "multiline": True, "placeholder": "Prompt 5"}),
+            },
+            "optional": opt,
+        }
+
+    RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "IMAGE", "IMAGE", "STRING", "STRING")
+    RETURN_NAMES = ("result_1", "result_2", "result_3", "result_4", "result_5", "operation_log", "raw_paths")
+    FUNCTION = "run"
+    CATEGORY = "Ace_Seedream"
+    DESCRIPTION = "Seedream editing via BytePlus Ark with up to 5 parallel slots."
+
+    def _slot_call(
+        self,
+        base_url: str,
+        key: str,
+        model: str,
+        prompt: str,
+        images: List[torch.Tensor],
+        size: str,
+        seed: int,
+        watermark: bool,
+        response_format: str,
+        seq: str,
+        max_images: int,
+        save_raw: bool,
+        slot_id: int,
+    ) -> Tuple[torch.Tensor, str, List[str]]:
+        log: List[str] = []
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "image": [_tensor_to_data_uri(im) for im in images],
+            "size": size,
+            "response_format": response_format,
+            "watermark": watermark,
+            "sequential_image_generation": seq,
+        }
+        if seq == "auto":
+            payload["sequential_image_generation_options"] = {"max_images": max_images}
+        if seed >= 0:
+            payload["seed"] = seed + slot_id - 1
+
+        t0 = time.time()
+        data = _throttled_call(_ark_post, base_url, key, payload)
+        log.append(f"Slot {slot_id}: Ark call completed in {time.time() - t0:.1f}s")
+
+        items = data.get("data") or []
+        if not items:
+            raise RuntimeError(f"Slot {slot_id}: no data. Response: {json.dumps(data)[:1000]}")
+
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        pils: List[Image.Image] = []
+        raw_paths: List[str] = []
+        for idx, item in enumerate(items):
+            raw = _ark_item_bytes(item)
+            pils.append(Image.open(BytesIO(raw)))
+            if save_raw:
+                rp = _save_raw(raw, f"seedream_ark_edit_{stamp}_s{slot_id}_{idx+1:02d}.png", log)
+                if rp:
+                    raw_paths.append(rp)
+        if data.get("usage"):
+            log.append(f"Slot {slot_id}: usage {json.dumps(data['usage'])}")
+        return _stack_rgb(pils), "\n".join(log), raw_paths
+
+    def run(
+        self,
+        api_key: str,
+        model: str = ARK_DEFAULT_MODEL,
+        in_parallel: int = 1,
+        parallels_share_inputs: bool = True,
+        prompt_1: str = "",
+        prompt_2: str = "",
+        prompt_3: str = "",
+        prompt_4: str = "",
+        prompt_5: str = "",
+        size: str = "2K",
+        seed: int = -1,
+        watermark: bool = False,
+        response_format: str = "url",
+        sequential_image_generation: str = "disabled",
+        max_images: int = 1,
+        base_url: str = ARK_DEFAULT_BASE,
+        save_raw: bool = True,
+        **kwargs,
+    ):
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        key = _get_ark_key(api_key)
+        prompts = [prompt_1, prompt_2, prompt_3, prompt_4, prompt_5]
+
+        def slot_images(i: int) -> List[torch.Tensor]:
+            idx = 1 if parallels_share_inputs else i
+            out = []
+            for name in (f"source_image_{idx}", f"ref_a_{idx}", f"ref_b_{idx}"):
+                im = kwargs.get(name)
+                if isinstance(im, torch.Tensor):
+                    out.append(im)
+            return out
+
+        slots = []
+        for i in range(1, in_parallel + 1):
+            p = (prompts[i - 1] or "").strip() or (prompt_1 if parallels_share_inputs else "")
+            if not p:
+                raise RuntimeError(f"Slot {i}: prompt required.")
+            imgs = slot_images(i)
+            if not imgs:
+                raise RuntimeError(f"Slot {i}: connect at least one image (source/ref_a/ref_b).")
+            slots.append((i, p, imgs))
+
+        results = {}
+        logs: List[str] = []
+        all_raw: List[str] = []
+        with ThreadPoolExecutor(max_workers=min(in_parallel, 5)) as ex:
+            futs = {
+                ex.submit(
+                    self._slot_call,
+                    base_url, key, model.strip(), p, imgs,
+                    size.strip() or "2K", seed, watermark, response_format,
+                    sequential_image_generation, max_images, save_raw, sid,
+                ): sid
+                for sid, p, imgs in slots
+            }
+            failed = []
+            for fut in as_completed(futs):
+                sid = futs[fut]
+                try:
+                    results[sid] = fut.result()
+                except Exception as e:
+                    failed.append((sid, str(e)))
+            if failed:
+                raise RuntimeError(
+                    "Parallel execution failed: " + "; ".join(f"Slot {s}: {m}" for s, m in failed)
+                )
+
+        out: List[torch.Tensor] = []
+        for i in range(1, in_parallel + 1):
+            t, m, rp = results[i]
+            out.append(t)
+            logs.append(m)
+            all_raw.extend(rp)
+        while len(out) < 5:
+            out.append(_placeholder())
+
+        return tuple(out + ["\n".join(logs), "\n".join(all_raw)])
+
+
 NODE_CLASS_MAPPINGS = {
     "AceSeedreamLayerize": AceSeedreamLayerize,
     "AceSeedreamProEdit": AceSeedreamProEdit,
+    "AceSeedreamLayerizeArk": AceSeedreamLayerizeArk,
+    "AceSeedreamProEditArk": AceSeedreamProEditArk,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "AceSeedreamLayerize": "ACE Seedream Layerize",
-    "AceSeedreamProEdit": "ACE Seedream Pro Edit",
+    "AceSeedreamLayerize": "ACE Seedream Layerize (fal)",
+    "AceSeedreamProEdit": "ACE Seedream Pro Edit (fal)",
+    "AceSeedreamLayerizeArk": "ACE Seedream Layerize (BytePlus)",
+    "AceSeedreamProEditArk": "ACE Seedream Pro Edit (BytePlus)",
 }
