@@ -129,6 +129,45 @@ def _save_raw(raw: bytes, name: str, log: List[str]) -> Optional[str]:
         return None
 
 
+def _pil_rgb_over_white(pil: Image.Image) -> Image.Image:
+    rgba = pil.convert("RGBA")
+    bg = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+    return Image.alpha_composite(bg, rgba).convert("RGB")
+
+
+def _pil_alpha_mask(pil: Image.Image) -> torch.Tensor:
+    a = np.asarray(pil.convert("RGBA"), dtype=np.float32)[..., 3] / 255.0
+    return torch.from_numpy(a)[None, ...]
+
+
+def _per_layer_outputs(layer_pils: List[Image.Image], log: List[str], n: int = 10):
+    """Individual native-size outputs: RGB composited over white + true alpha masks."""
+    imgs: List[torch.Tensor] = []
+    masks: List[torch.Tensor] = []
+    for i in range(n):
+        if i < len(layer_pils):
+            p = layer_pils[i]
+            imgs.append(_pil_to_tensor_rgb(_pil_rgb_over_white(p)))
+            masks.append(_pil_alpha_mask(p))
+        else:
+            imgs.append(_placeholder(64))
+            masks.append(_placeholder_mask(64))
+    if len(layer_pils) > n:
+        log.append(
+            f"{len(layer_pils) - n} extra layer(s) beyond {n} sockets - full set in raw_paths/layer_info"
+        )
+    return imgs, masks
+
+
+_LAYER_RETURN_TYPES = ("IMAGE",) + ("IMAGE",) * 10 + ("MASK",) * 10 + ("STRING", "STRING", "STRING")
+_LAYER_RETURN_NAMES = tuple(
+    ["base_image"]
+    + [f"layer_{i}" for i in range(1, 11)]
+    + [f"mask_{i}" for i in range(1, 11)]
+    + ["layer_info", "raw_paths", "operation_log"]
+)
+
+
 def _stack_rgb(pils: List[Image.Image]) -> torch.Tensor:
     if not pils:
         return _placeholder()
@@ -203,13 +242,13 @@ class AceSeedreamLayerize:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "IMAGE", "MASK", "STRING", "STRING", "STRING")
-    RETURN_NAMES = ("base_image", "layers", "layer_masks", "layer_info", "raw_paths", "operation_log")
+    RETURN_TYPES = _LAYER_RETURN_TYPES
+    RETURN_NAMES = _LAYER_RETURN_NAMES
     FUNCTION = "run"
     CATEGORY = "Ace_Seedream"
     DESCRIPTION = (
-        "Seedream 5.0 Pro Layerize via fal: base image + up to 16 transparent layers. "
-        "Layer count is model-decided (no API parameter); steer via prompt."
+        "Seedream 5.0 Pro Layerize via fal: base image + up to 10 individual native-size layers "
+        "(RGB over white) with true alpha masks. Layer count is model-decided; steer via prompt."
     )
 
     def _call(self, key: str, image: torch.Tensor, prompt: str, image_size: str,
@@ -308,16 +347,11 @@ class AceSeedreamLayerize:
             base_t = _pil_to_tensor_rgb(base_pil)
         else:
             base_t = _placeholder()
-        layers_t = _stack_rgb(layer_pils) if layer_pils else _placeholder()
-        masks_t = _stack_alpha(layer_pils) if layer_pils else _placeholder_mask()
 
-        return (
-            base_t,
-            layers_t,
-            masks_t,
-            json.dumps(info, indent=2),
-            "\n".join(raw_paths),
-            "\n".join(log),
+        imgs, masks = _per_layer_outputs(layer_pils, log, 10)
+        return tuple(
+            [base_t] + imgs + masks
+            + [json.dumps(info, indent=2), "\n".join(raw_paths), "\n".join(log)]
         )
 
 
@@ -530,13 +564,13 @@ class AceSeedreamLayerizeArk:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "IMAGE", "MASK", "STRING", "STRING", "STRING")
-    RETURN_NAMES = ("base_image", "layers", "layer_masks", "layer_info", "raw_paths", "operation_log")
+    RETURN_TYPES = _LAYER_RETURN_TYPES
+    RETURN_NAMES = _LAYER_RETURN_NAMES
     FUNCTION = "run"
     CATEGORY = "Ace_Seedream"
     DESCRIPTION = (
-        "Seedream layer decomposition via BytePlus Ark. Layer count is model-decided; "
-        "num_layers only steers via the prompt."
+        "Seedream layer decomposition via BytePlus Ark: base + up to 10 individual native-size "
+        "layers with alpha masks. Layer count is model-decided; num_layers steers via prompt."
     )
 
     def run(
@@ -622,16 +656,10 @@ class AceSeedreamLayerizeArk:
             log.append(f"usage: {json.dumps(data['usage'])}")
 
         base_t = _pil_to_tensor_rgb(base_pil) if base_pil is not None else _placeholder()
-        layers_t = _stack_rgb(layer_pils) if layer_pils else _placeholder()
-        masks_t = _stack_alpha(layer_pils) if layer_pils else _placeholder_mask()
-
-        return (
-            base_t,
-            layers_t,
-            masks_t,
-            json.dumps(info, indent=2),
-            "\n".join(raw_paths),
-            "\n".join(log),
+        imgs, masks = _per_layer_outputs(layer_pils, log, 10)
+        return tuple(
+            [base_t] + imgs + masks
+            + [json.dumps(info, indent=2), "\n".join(raw_paths), "\n".join(log)]
         )
 
 
