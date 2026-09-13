@@ -145,26 +145,36 @@ def _bbox_place(pil: Image.Image, bbox, canvas_w: int, canvas_h: int, log: List[
     canvas = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
     rgba = pil.convert("RGBA")
     try:
+        if rgba.size == (canvas_w, canvas_h):
+            # layer already full-canvas: alpha carries the position
+            return rgba.copy()
+        ltrb = None
         if isinstance(bbox, dict):
-            x = int(round(bbox.get("x", bbox.get("left", 0))))
-            y = int(round(bbox.get("y", bbox.get("top", 0))))
-            w = int(round(bbox.get("width", bbox.get("w", rgba.width))))
-            h = int(round(bbox.get("height", bbox.get("h", rgba.height))))
+            # official format: {"absolute": [l,t,r,b], "normalized": [0-1000 l,t,r,b]}
+            if isinstance(bbox.get("absolute"), (list, tuple)) and len(bbox["absolute"]) >= 4:
+                ltrb = [int(round(v)) for v in bbox["absolute"][:4]]
+            elif isinstance(bbox.get("normalized"), (list, tuple)) and len(bbox["normalized"]) >= 4:
+                nl, nt, nr, nb = bbox["normalized"][:4]
+                ltrb = [
+                    int(round(nl / 1000.0 * canvas_w)),
+                    int(round(nt / 1000.0 * canvas_h)),
+                    int(round(nr / 1000.0 * canvas_w)),
+                    int(round(nb / 1000.0 * canvas_h)),
+                ]
         elif isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
-            x, y, w, h = (int(round(v)) for v in bbox[:4])
-            if x + w > canvas_w or y + h > canvas_h:
-                # treat as x1,y1,x2,y2 if x2/y2 read like coordinates
-                x1, y1, x2, y2 = (int(round(v)) for v in bbox[:4])
-                if x2 > x1 and y2 > y1 and x2 <= canvas_w and y2 <= canvas_h:
-                    x, y, w, h = x1, y1, x2 - x1, y2 - y1
-        else:
+            ltrb = [int(round(v)) for v in bbox[:4]]
+        if ltrb is None:
             raise ValueError(f"unrecognized bbox: {bbox!r}")
-        if (w, h) != rgba.size and w > 0 and h > 0:
+        left, top, right, bottom = ltrb
+        w, h = right - left, bottom - top
+        if w <= 0 or h <= 0:
+            raise ValueError(f"degenerate bbox: {ltrb}")
+        if (w, h) != rgba.size:
             rgba = rgba.resize((w, h), Image.LANCZOS)
-        canvas.paste(rgba, (x, y), rgba)
+        canvas.paste(rgba, (left, top))  # no mask: empty canvas, plain copy keeps true alpha
     except Exception as e:
         log.append(f"{tag}: bbox placement failed ({e}); layer centered instead.")
-        canvas.paste(rgba, ((canvas_w - rgba.width) // 2, (canvas_h - rgba.height) // 2), rgba)
+        canvas.paste(rgba, ((canvas_w - rgba.width) // 2, (canvas_h - rgba.height) // 2))
     return canvas
 
 
