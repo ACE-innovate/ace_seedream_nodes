@@ -140,6 +140,34 @@ def _pil_alpha_mask(pil: Image.Image) -> torch.Tensor:
     return torch.from_numpy(a)[None, ...]
 
 
+def _bbox_place(pil: Image.Image, bbox, canvas_w: int, canvas_h: int, log: List[str], tag: str) -> Image.Image:
+    """Place a cropped RGBA layer at its bounding_box position on a full-size transparent canvas."""
+    canvas = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+    rgba = pil.convert("RGBA")
+    try:
+        if isinstance(bbox, dict):
+            x = int(round(bbox.get("x", bbox.get("left", 0))))
+            y = int(round(bbox.get("y", bbox.get("top", 0))))
+            w = int(round(bbox.get("width", bbox.get("w", rgba.width))))
+            h = int(round(bbox.get("height", bbox.get("h", rgba.height))))
+        elif isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
+            x, y, w, h = (int(round(v)) for v in bbox[:4])
+            if x + w > canvas_w or y + h > canvas_h:
+                # treat as x1,y1,x2,y2 if x2/y2 read like coordinates
+                x1, y1, x2, y2 = (int(round(v)) for v in bbox[:4])
+                if x2 > x1 and y2 > y1 and x2 <= canvas_w and y2 <= canvas_h:
+                    x, y, w, h = x1, y1, x2 - x1, y2 - y1
+        else:
+            raise ValueError(f"unrecognized bbox: {bbox!r}")
+        if (w, h) != rgba.size and w > 0 and h > 0:
+            rgba = rgba.resize((w, h), Image.LANCZOS)
+        canvas.paste(rgba, (x, y), rgba)
+    except Exception as e:
+        log.append(f"{tag}: bbox placement failed ({e}); layer centered instead.")
+        canvas.paste(rgba, ((canvas_w - rgba.width) // 2, (canvas_h - rgba.height) // 2), rgba)
+    return canvas
+
+
 def _per_layer_outputs(layer_pils: List[Image.Image], log: List[str], n: int = 10):
     """Individual native-size outputs: RGB composited over white + true alpha masks."""
     imgs: List[torch.Tensor] = []
@@ -232,6 +260,13 @@ class AceSeedreamLayerize:
                     "BOOLEAN",
                     {"default": True, "tooltip": "Save untouched layer PNGs (with alpha) to the output folder"},
                 ),
+                "place_on_canvas": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Place each layer at its bounding_box position on a full-canvas transparent frame (z-ordered). Stack layer_1..N over base_image to reconstruct the original; off = cropped native-size layers.",
+                    },
+                ),
                 "compare_modes": (
                     "BOOLEAN",
                     {
@@ -277,6 +312,7 @@ class AceSeedreamLayerize:
         enhance_prompt_mode: str = "standard",
         save_raw: bool = True,
         compare_modes: bool = False,
+        place_on_canvas: bool = True,
         **kwargs,
     ):
         key = _get_key(api_key)
@@ -336,9 +372,20 @@ class AceSeedreamLayerize:
             if z == 0 and base_pil is None:
                 base_pil = pil
             else:
-                layer_pils.append(pil)
+                layer_pils.append((z, pil, layer.get("bounding_box")))
 
+        layer_pils.sort(key=lambda t: t[0])
         log.append(f"{len(info)} layers total ({len(layer_pils)} above base)")
+        if place_on_canvas and base_pil is not None:
+            cw, ch = base_pil.size
+            layer_pils = [
+                _bbox_place(p, bb, cw, ch, log, f"layer z{z}") for z, p, bb in layer_pils
+            ]
+            log.append(f"layers placed on {cw}x{ch} canvas by bounding_box, z-ordered")
+        else:
+            if place_on_canvas:
+                log.append("place_on_canvas: no base image found; layers left cropped")
+            layer_pils = [p for _, p, _ in layer_pils]
 
         if base_pil is not None and compare_base is not None:
             base_t = _stack_rgb([base_pil, compare_base])
@@ -561,6 +608,13 @@ class AceSeedreamLayerizeArk:
                     "BOOLEAN",
                     {"default": True, "tooltip": "Save untouched layer files to the output folder"},
                 ),
+                "place_on_canvas": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Place each layer at its bounding_box position on a full-canvas transparent frame (z-ordered). Stack layer_1..N over base_image to reconstruct the original; off = cropped native-size layers.",
+                    },
+                ),
             },
         }
 
@@ -586,6 +640,7 @@ class AceSeedreamLayerizeArk:
         response_format: str = "url",
         base_url: str = ARK_DEFAULT_BASE,
         save_raw: bool = True,
+        place_on_canvas: bool = True,
         **kwargs,
     ):
         key = _get_ark_key(api_key)
@@ -649,9 +704,20 @@ class AceSeedreamLayerizeArk:
             if z == 0 and base_pil is None:
                 base_pil = pil
             else:
-                layer_pils.append(pil)
+                layer_pils.append((z, pil, item.get("bounding_box")))
 
+        layer_pils.sort(key=lambda t: t[0])
         log.append(f"{len(info)} items total ({len(layer_pils)} above base)")
+        if place_on_canvas and base_pil is not None:
+            cw, ch = base_pil.size
+            layer_pils = [
+                _bbox_place(pp, bb, cw, ch, log, f"layer z{z}") for z, pp, bb in layer_pils
+            ]
+            log.append(f"layers placed on {cw}x{ch} canvas by bounding_box, z-ordered")
+        else:
+            if place_on_canvas:
+                log.append("place_on_canvas: no base image found; layers left cropped")
+            layer_pils = [pp for _, pp, _ in layer_pils]
         if data.get("usage"):
             log.append(f"usage: {json.dumps(data['usage'])}")
 
