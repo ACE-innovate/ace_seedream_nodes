@@ -212,10 +212,11 @@ def _fabric_data(
     """Build Compositor V4 fabricData JSON: base in slot 1, layer_1..7 in slots 2..8.
     Positions = padding + bbox left/top. With place_on_canvas ON layers are full-canvas,
     so every slot sits at (padding, padding) at canvas size."""
-    def entry(left, top, w, h):
+    def entry(left, top, w, h, sx=1.0, sy=1.0):
+        # fabric.js semantics: displayed size = natural size (xwidth/xheight) * scale
         return {
-            "left": left, "top": top, "scaleX": 1, "scaleY": 1, "angle": 0,
-            "flipX": False, "flipY": False, "originX": "left", "originY": "top",
+            "left": left, "top": top, "scaleX": round(sx, 6), "scaleY": round(sy, 6),
+            "angle": 0, "flipX": False, "flipY": False, "originX": "left", "originY": "top",
             "xwidth": w, "xheight": h, "skewY": 0, "skewX": 0, "opacity": 1,
             "visible": True, "selectable": True, "evented": True,
         }
@@ -228,8 +229,12 @@ def _fabric_data(
         else:
             geo = layers_geo[i] if i < len(layers_geo) else None
             w, h = layer_sizes[i]
-            if geo is not None:
-                transforms.append(entry(padding + geo[0], padding + geo[1], w, h))
+            if geo is not None and w > 0 and h > 0:
+                bw, bh = geo[2] - geo[0], geo[3] - geo[1]
+                transforms.append(
+                    entry(padding + geo[0], padding + geo[1], w, h,
+                          sx=bw / float(w), sy=bh / float(h))
+                )
             else:
                 transforms.append(entry(padding, padding, w, h))
     while len(transforms) < FABRIC_SLOTS:
@@ -241,7 +246,12 @@ def _fabric_data(
             f"{len(layer_sizes) - (FABRIC_SLOTS - 1)} layer(s) not included."
         )
     bboxes = [
-        {"left": t["left"], "top": t["top"], "xwidth": t["xwidth"], "xheight": t["xheight"]}
+        {
+            "left": t["left"],
+            "top": t["top"],
+            "xwidth": round(t["xwidth"] * t["scaleX"], 4),
+            "xheight": round(t["xheight"] * t["scaleY"], 4),
+        }
         if isinstance(t, dict) else None
         for t in transforms
     ]
