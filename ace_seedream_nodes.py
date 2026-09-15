@@ -140,6 +140,26 @@ def _pil_alpha_mask(pil: Image.Image) -> torch.Tensor:
     return torch.from_numpy(a)[None, ...]
 
 
+def _bbox_ltrb(bbox, canvas_w: int, canvas_h: int) -> Optional[List[int]]:
+    """Parse API bounding_box to [left, top, right, bottom] pixels, or None.
+    Official format: {"absolute": [l,t,r,b], "normalized": [0-1000 l,t,r,b]}."""
+    if isinstance(bbox, dict):
+        if isinstance(bbox.get("absolute"), (list, tuple)) and len(bbox["absolute"]) >= 4:
+            return [int(round(v)) for v in bbox["absolute"][:4]]
+        if isinstance(bbox.get("normalized"), (list, tuple)) and len(bbox["normalized"]) >= 4:
+            nl, nt, nr, nb = bbox["normalized"][:4]
+            return [
+                int(round(nl / 1000.0 * canvas_w)),
+                int(round(nt / 1000.0 * canvas_h)),
+                int(round(nr / 1000.0 * canvas_w)),
+                int(round(nb / 1000.0 * canvas_h)),
+            ]
+        return None
+    if isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
+        return [int(round(v)) for v in bbox[:4]]
+    return None
+
+
 def _bbox_place(pil: Image.Image, bbox, canvas_w: int, canvas_h: int, log: List[str], tag: str) -> Image.Image:
     """Place a cropped RGBA layer at its bounding_box position on a full-size transparent canvas."""
     canvas = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
@@ -148,21 +168,7 @@ def _bbox_place(pil: Image.Image, bbox, canvas_w: int, canvas_h: int, log: List[
         if rgba.size == (canvas_w, canvas_h):
             # layer already full-canvas: alpha carries the position
             return rgba.copy()
-        ltrb = None
-        if isinstance(bbox, dict):
-            # official format: {"absolute": [l,t,r,b], "normalized": [0-1000 l,t,r,b]}
-            if isinstance(bbox.get("absolute"), (list, tuple)) and len(bbox["absolute"]) >= 4:
-                ltrb = [int(round(v)) for v in bbox["absolute"][:4]]
-            elif isinstance(bbox.get("normalized"), (list, tuple)) and len(bbox["normalized"]) >= 4:
-                nl, nt, nr, nb = bbox["normalized"][:4]
-                ltrb = [
-                    int(round(nl / 1000.0 * canvas_w)),
-                    int(round(nt / 1000.0 * canvas_h)),
-                    int(round(nr / 1000.0 * canvas_w)),
-                    int(round(nb / 1000.0 * canvas_h)),
-                ]
-        elif isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
-            ltrb = [int(round(v)) for v in bbox[:4]]
+        ltrb = _bbox_ltrb(bbox, canvas_w, canvas_h)
         if ltrb is None:
             raise ValueError(f"unrecognized bbox: {bbox!r}")
         left, top, right, bottom = ltrb
@@ -178,7 +184,87 @@ def _bbox_place(pil: Image.Image, bbox, canvas_w: int, canvas_h: int, log: List[
     return canvas
 
 
-def _per_layer_outputs(layer_pils: List[Image.Image], log: List[str], n: int = 10):
+N_SOCKETS = 12  # layer sockets per Layerize node (API max is 16; extras go to raw_paths/layer_info)
+FABRIC_SLOTS = 8  # Compositor V4 Config has 8 image inputs: base -> image1, layer_1..7 -> image2..8
+
+
+def _num_layers_steer(prompt: str, num_layers: int, log: List[str]) -> str:
+    """Inject layer-count guidance into the prompt. No provider exposes a count parameter."""
+    p = (prompt or "").strip()
+    if num_layers > 0:
+        steer = f"Decompose the image into exactly {num_layers} separate layers."
+        p = (p + " " + steer).strip() if p else steer
+        log.append(
+            f"num_layers={num_layers}: prompt-steered only (no API parameter exists); model may deviate."
+        )
+    return p
+
+
+def _fabric_data(
+    canvas_w: int,
+    canvas_h: int,
+    padding: int,
+    placed: bool,
+    layers_geo: List[Optional[List[int]]],
+    layer_sizes: List[Tuple[int, int]],
+    log: List[str],
+) -> str:
+    """Build Compositor V4 fabricData JSON: base in slot 1, layer_1..7 in slots 2..8.
+    Positions = padding + bbox left/top. With place_on_canvas ON layers are full-canvas,
+    so every slot sits at (padding, padding) at canvas size."""
+    def entry(left, top, w, h):
+        return {
+            "left": left, "top": top, "scaleX": 1, "scaleY": 1, "angle": 0,
+            "flipX": False, "flipY": False, "originX": "left", "originY": "top",
+            "xwidth": w, "xheight": h, "skewY": 0, "skewX": 0, "opacity": 1,
+            "visible": True, "selectable": True, "evented": True,
+        }
+
+    transforms = [entry(padding, padding, canvas_w, canvas_h)]  # base, slot 1
+    n_layers = min(len(layer_sizes), FABRIC_SLOTS - 1)
+    for i in range(n_layers):
+        if placed:
+            transforms.append(entry(padding, padding, canvas_w, canvas_h))
+        else:
+            geo = layers_geo[i] if i < len(layers_geo) else None
+            w, h = layer_sizes[i]
+            if geo is not None:
+                transforms.append(entry(padding + geo[0], padding + geo[1], w, h))
+            else:
+                transforms.append(entry(padding, padding, w, h))
+    while len(transforms) < FABRIC_SLOTS:
+        transforms.append(None)
+    transforms.append(None)  # 9th trailing slot as observed in Compositor state
+    if len(layer_sizes) > FABRIC_SLOTS - 1:
+        log.append(
+            f"fabric data covers base + {FABRIC_SLOTS - 1} layers (Compositor has {FABRIC_SLOTS} slots); "
+            f"{len(layer_sizes) - (FABRIC_SLOTS - 1)} layer(s) not included."
+        )
+    bboxes = [
+        {"left": t["left"], "top": t["top"], "xwidth": t["xwidth"], "xheight": t["xheight"]}
+        if isinstance(t, dict) else None
+        for t in transforms
+    ]
+    return json.dumps(
+        {
+            "transforms": transforms,
+            "bboxes": bboxes,
+            "imageNames": [None] * len(transforms),
+            "imagePositions": list(range(len(transforms))),
+            "maskStates": [True] * len(transforms),
+            "applyMaskInConfig": True,
+            "snapEnabled": False,
+            "gridSize": 1,
+            "width": canvas_w,
+            "height": canvas_h,
+            "padding": padding,
+            "backgroundColor": "rgba(0,0,0,0.2)",
+            "foregroundImageName": None,
+        }
+    )
+
+
+def _per_layer_outputs(layer_pils: List[Image.Image], log: List[str], n: int = N_SOCKETS):
     """Individual native-size outputs: RGB composited over white + true alpha masks."""
     imgs: List[torch.Tensor] = []
     masks: List[torch.Tensor] = []
@@ -197,12 +283,14 @@ def _per_layer_outputs(layer_pils: List[Image.Image], log: List[str], n: int = 1
     return imgs, masks
 
 
-_LAYER_RETURN_TYPES = ("IMAGE",) + ("IMAGE",) * 10 + ("MASK",) * 10 + ("STRING", "STRING", "STRING")
+_LAYER_RETURN_TYPES = (
+    ("IMAGE",) + ("IMAGE",) * N_SOCKETS + ("MASK",) * N_SOCKETS + ("STRING", "STRING", "STRING", "STRING")
+)
 _LAYER_RETURN_NAMES = tuple(
     ["base_image"]
-    + [f"layer_{i}" for i in range(1, 11)]
-    + [f"mask_{i}" for i in range(1, 11)]
-    + ["layer_info", "raw_paths", "operation_log"]
+    + [f"layer_{i}" for i in range(1, N_SOCKETS + 1)]
+    + [f"mask_{i}" for i in range(1, N_SOCKETS + 1)]
+    + ["compositor_fabric_data", "layer_info", "raw_paths", "operation_log"]
 )
 
 
@@ -270,11 +358,29 @@ class AceSeedreamLayerize:
                     "BOOLEAN",
                     {"default": True, "tooltip": "Save untouched layer PNGs (with alpha) to the output folder"},
                 ),
+                "num_layers": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": N_SOCKETS,
+                        "tooltip": "0 = model decides. Otherwise injected into the prompt as guidance - the API has NO layer-count parameter, so this steers but does not guarantee.",
+                    },
+                ),
+                "fabric_padding": (
+                    "INT",
+                    {
+                        "default": 100,
+                        "min": 0,
+                        "max": 1024,
+                        "tooltip": "Must match the Compositor Config padding. Used only for the compositor_fabric_data output.",
+                    },
+                ),
                 "place_on_canvas": (
                     "BOOLEAN",
                     {
                         "default": True,
-                        "tooltip": "Place each layer at its bounding_box position on a full-canvas transparent frame (z-ordered). Stack layer_1..N over base_image to reconstruct the original; off = cropped native-size layers.",
+                        "tooltip": "Place each layer at its bounding_box position on a full-canvas transparent frame (z-ordered). Stack layer_1..N over base_image to reconstruct the original; off = cropped native-size layers for Compositor (wire compositor_fabric_data for positions).",
                     },
                 ),
                 "compare_modes": (
@@ -323,10 +429,13 @@ class AceSeedreamLayerize:
         save_raw: bool = True,
         compare_modes: bool = False,
         place_on_canvas: bool = True,
+        num_layers: int = 0,
+        fabric_padding: int = 100,
         **kwargs,
     ):
         key = _get_key(api_key)
         log: List[str] = []
+        prompt = _num_layers_steer(prompt, num_layers, log)
 
         compare_base: Optional[Image.Image] = None
         if compare_modes:
@@ -386,8 +495,10 @@ class AceSeedreamLayerize:
 
         layer_pils.sort(key=lambda t: t[0])
         log.append(f"{len(info)} layers total ({len(layer_pils)} above base)")
+        cw, ch = base_pil.size if base_pil is not None else (2048, 2048)
+        layers_geo = [_bbox_ltrb(bb, cw, ch) for _, _, bb in layer_pils]
+        layer_sizes = [p.size for _, p, _ in layer_pils]
         if place_on_canvas and base_pil is not None:
-            cw, ch = base_pil.size
             layer_pils = [
                 _bbox_place(p, bb, cw, ch, log, f"layer z{z}") for z, p, bb in layer_pils
             ]
@@ -396,6 +507,8 @@ class AceSeedreamLayerize:
             if place_on_canvas:
                 log.append("place_on_canvas: no base image found; layers left cropped")
             layer_pils = [p for _, p, _ in layer_pils]
+        fabric = _fabric_data(cw, ch, fabric_padding, place_on_canvas and base_pil is not None,
+                              layers_geo, layer_sizes, log)
 
         if base_pil is not None and compare_base is not None:
             base_t = _stack_rgb([base_pil, compare_base])
@@ -405,10 +518,10 @@ class AceSeedreamLayerize:
         else:
             base_t = _placeholder()
 
-        imgs, masks = _per_layer_outputs(layer_pils, log, 10)
+        imgs, masks = _per_layer_outputs(layer_pils, log, N_SOCKETS)
         return tuple(
             [base_t] + imgs + masks
-            + [json.dumps(info, indent=2), "\n".join(raw_paths), "\n".join(log)]
+            + [fabric, json.dumps(info, indent=2), "\n".join(raw_paths), "\n".join(log)]
         )
 
 
@@ -602,8 +715,17 @@ class AceSeedreamLayerizeArk:
                     {
                         "default": 0,
                         "min": 0,
-                        "max": 16,
+                        "max": N_SOCKETS,
                         "tooltip": "0 = model decides. Otherwise injected into the prompt as guidance - the API has NO layer-count parameter, so this steers but does not guarantee.",
+                    },
+                ),
+                "fabric_padding": (
+                    "INT",
+                    {
+                        "default": 100,
+                        "min": 0,
+                        "max": 1024,
+                        "tooltip": "Must match the Compositor Config padding. Used only for the compositor_fabric_data output.",
                     },
                 ),
                 "size": ("STRING", {"default": "2K", "tooltip": "e.g. 2K, 4K or 2048x2048"}),
@@ -651,18 +773,13 @@ class AceSeedreamLayerizeArk:
         base_url: str = ARK_DEFAULT_BASE,
         save_raw: bool = True,
         place_on_canvas: bool = True,
+        fabric_padding: int = 100,
         **kwargs,
     ):
         key = _get_ark_key(api_key)
         log: List[str] = []
 
-        p = prompt.strip()
-        if num_layers > 0:
-            steer = f"Decompose the image into exactly {num_layers} separate layers."
-            p = (p + " " + steer).strip() if p else steer
-            log.append(
-                f"num_layers={num_layers}: prompt-steered only (no API parameter exists); model may deviate."
-            )
+        p = _num_layers_steer(prompt, num_layers, log)
 
         payload = {
             "model": model.strip(),
@@ -718,8 +835,10 @@ class AceSeedreamLayerizeArk:
 
         layer_pils.sort(key=lambda t: t[0])
         log.append(f"{len(info)} items total ({len(layer_pils)} above base)")
+        cw, ch = base_pil.size if base_pil is not None else (2048, 2048)
+        layers_geo = [_bbox_ltrb(bb, cw, ch) for _, _, bb in layer_pils]
+        layer_sizes = [pp.size for _, pp, _ in layer_pils]
         if place_on_canvas and base_pil is not None:
-            cw, ch = base_pil.size
             layer_pils = [
                 _bbox_place(pp, bb, cw, ch, log, f"layer z{z}") for z, pp, bb in layer_pils
             ]
@@ -728,14 +847,16 @@ class AceSeedreamLayerizeArk:
             if place_on_canvas:
                 log.append("place_on_canvas: no base image found; layers left cropped")
             layer_pils = [pp for _, pp, _ in layer_pils]
+        fabric = _fabric_data(cw, ch, fabric_padding, place_on_canvas and base_pil is not None,
+                              layers_geo, layer_sizes, log)
         if data.get("usage"):
             log.append(f"usage: {json.dumps(data['usage'])}")
 
         base_t = _pil_to_tensor_rgb(base_pil) if base_pil is not None else _placeholder()
-        imgs, masks = _per_layer_outputs(layer_pils, log, 10)
+        imgs, masks = _per_layer_outputs(layer_pils, log, N_SOCKETS)
         return tuple(
             [base_t] + imgs + masks
-            + [json.dumps(info, indent=2), "\n".join(raw_paths), "\n".join(log)]
+            + [fabric, json.dumps(info, indent=2), "\n".join(raw_paths), "\n".join(log)]
         )
 
 
