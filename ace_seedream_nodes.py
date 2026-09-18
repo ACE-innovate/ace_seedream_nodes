@@ -684,7 +684,7 @@ class AceSeedreamProEdit:
 # =====================================================================
 
 ARK_DEFAULT_BASE = "https://ark.ap-southeast.bytepluses.com/api/v3"
-ARK_DEFAULT_MODEL = "seedream-5-0-pro"
+ARK_DEFAULT_MODEL = "dola-seedream-5-0-pro-260628"  # verified live on ark.ap-southeast; suffix may change - see Ark console Model list
 
 
 def _get_ark_key(api_key: str) -> str:
