@@ -185,6 +185,17 @@ def _bbox_place(pil: Image.Image, bbox, canvas_w: int, canvas_h: int, log: List[
 
 
 N_SOCKETS = 12  # layer sockets per Layerize node (API max is 16; extras go to raw_paths/layer_info)
+
+
+def _push_fabric_to_frontend(fabric: str, log: List[str]) -> None:
+    """Broadcast fabric JSON to the browser; the bundled web extension writes it into
+    every Compositor4 node's fabricData widget and calls editor.restoreState()."""
+    try:
+        from server import PromptServer
+        PromptServer.instance.send_sync("ace_seedream_fabric", {"fabric": fabric})
+        log.append("fabric pushed to Compositor4 (auto-apply)")
+    except Exception as e:
+        log.append(f"fabric push unavailable ({e}); paste compositor_fabric_data manually")
 FABRIC_SLOTS = 8  # Compositor V4 Config has 8 image inputs: base -> image1, layer_1..7 -> image2..8
 
 
@@ -386,6 +397,13 @@ class AceSeedreamLayerize:
                         "tooltip": "Must match the Compositor Config padding. Used only for the compositor_fabric_data output.",
                     },
                 ),
+                "push_to_compositor": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Auto-apply the placement to every Compositor4 node in the workflow (writes fabricData + restoreState). Off = wire/paste compositor_fabric_data yourself.",
+                    },
+                ),
                 "place_on_canvas": (
                     "BOOLEAN",
                     {
@@ -441,6 +459,7 @@ class AceSeedreamLayerize:
         place_on_canvas: bool = True,
         num_layers: int = 0,
         fabric_padding: int = 100,
+        push_to_compositor: bool = True,
         **kwargs,
     ):
         key = _get_key(api_key)
@@ -504,6 +523,7 @@ class AceSeedreamLayerize:
                 layer_pils.append((z, pil, layer.get("bounding_box")))
 
         layer_pils.sort(key=lambda t: t[0])
+        info.sort(key=lambda d: (d.get("z_index") or 0))  # align layer_info with socket/fabric z-order
         log.append(f"{len(info)} layers total ({len(layer_pils)} above base)")
         cw, ch = base_pil.size if base_pil is not None else (2048, 2048)
         layers_geo = [_bbox_ltrb(bb, cw, ch) for _, _, bb in layer_pils]
@@ -519,6 +539,8 @@ class AceSeedreamLayerize:
             layer_pils = [p for _, p, _ in layer_pils]
         fabric = _fabric_data(cw, ch, fabric_padding, place_on_canvas and base_pil is not None,
                               layers_geo, layer_sizes, log)
+        if push_to_compositor:
+            _push_fabric_to_frontend(fabric, log)
 
         if base_pil is not None and compare_base is not None:
             base_t = _stack_rgb([base_pil, compare_base])
@@ -738,6 +760,13 @@ class AceSeedreamLayerizeArk:
                         "tooltip": "Must match the Compositor Config padding. Used only for the compositor_fabric_data output.",
                     },
                 ),
+                "push_to_compositor": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Auto-apply the placement to every Compositor4 node in the workflow (writes fabricData + restoreState). Off = wire/paste compositor_fabric_data yourself.",
+                    },
+                ),
                 "size": ("STRING", {"default": "2K", "tooltip": "e.g. 2K, 4K or 2048x2048"}),
                 "seed": ("INT", {"default": -1, "min": -1, "max": 0x7FFFFFFF, "tooltip": "-1 = omit"}),
                 "watermark": (
@@ -784,6 +813,7 @@ class AceSeedreamLayerizeArk:
         save_raw: bool = True,
         place_on_canvas: bool = True,
         fabric_padding: int = 100,
+        push_to_compositor: bool = True,
         **kwargs,
     ):
         key = _get_ark_key(api_key)
@@ -844,6 +874,7 @@ class AceSeedreamLayerizeArk:
                 layer_pils.append((z, pil, item.get("bounding_box")))
 
         layer_pils.sort(key=lambda t: t[0])
+        info.sort(key=lambda d: (d.get("z_index") or 0))  # align layer_info with socket/fabric z-order
         log.append(f"{len(info)} items total ({len(layer_pils)} above base)")
         cw, ch = base_pil.size if base_pil is not None else (2048, 2048)
         layers_geo = [_bbox_ltrb(bb, cw, ch) for _, _, bb in layer_pils]
@@ -859,6 +890,8 @@ class AceSeedreamLayerizeArk:
             layer_pils = [pp for _, pp, _ in layer_pils]
         fabric = _fabric_data(cw, ch, fabric_padding, place_on_canvas and base_pil is not None,
                               layers_geo, layer_sizes, log)
+        if push_to_compositor:
+            _push_fabric_to_frontend(fabric, log)
         if data.get("usage"):
             log.append(f"usage: {json.dumps(data['usage'])}")
 
